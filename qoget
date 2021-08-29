@@ -1,0 +1,206 @@
+#!/bin/python
+
+import base64
+import functools
+import gzip
+import hashlib
+import io
+import json
+import operator
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+def qobuz(username, password):
+  def call(base, endpoint, params, headers, secret = None):
+    if secret:
+      signature = hashlib.md5(endpoint.replace('/', '').encode('utf-8'))
+      for key in sorted(params):
+        signature.update((key + str(params[key])).encode('utf-8'))
+      params['request_ts'] = str(time.time())
+      signature.update((params['request_ts'] + secret).encode('utf-8'))
+      params['request_sig'] = signature.hexdigest()
+    url = base + endpoint + '?' + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers = headers)
+    return json.load(urllib.request.urlopen(request))
+
+  def get(url):
+    request = urllib.request.Request(url)
+    request.add_header('Accept-Encoding', 'gzip')
+    response = urllib.request.urlopen(request)
+    if response.info().get('Content-Encoding') == 'gzip':
+      return gzip.decompress(response.read()).decode('utf-8')
+    else:
+      return response.read().decode('utf-8')
+
+  def stream(base, headers, secret):
+    def stream(id, format = 27):
+      file = call(base, 'track/getFileUrl', { 'format_id': format,
+        'intent': 'stream', 'track_id': id }, headers, secret)
+      request = urllib.request.Request(file['url'])
+      return urllib.request.urlopen(request)
+    return stream
+
+  try:
+    pattern = r'<script src="(/resources/[^"]*/bundle\.js)">'
+    bundle = re.search(pattern, get('https://play.qobuz.com/login'))
+    bundle = get('https://play.qobuz.com' + bundle[1])
+  except TypeError:
+    raise ValueError('bundle.js not found on play.qobuz.com')
+
+  try:
+    api = re.search(r'qobuzapi={\w+:"[^"]+"(?:,\w+:"[^"]+")*}', bundle)
+    api = dict(re.findall(r'(\w+):"([^"]+)"', api[0]))
+    base = api['base_url'] + api['base_method']
+  except TypeError:
+    raise ValueError('API parameters not found')
+
+  try:
+    login = call(base, 'user/login', { 'app_id': api['app_id'],
+      'email': username, 'password': password }, {})
+    headers = {
+      'X-App-Id': api['app_id'],
+      'X-User-Auth-Token': login['user_auth_token']
+    }
+  except urllib.error.URLError:
+    raise ValueError('invalid username or password')
+  except KeyError:
+    raise ValueError('unsupported account type')
+
+  album = lambda id: call(base, 'album/get', { 'album_id': id }, headers)
+  track = lambda id: call(base, 'track/get', { 'track_id': id }, headers)
+
+  pattern = r'\w\.initialSeed\("([\w=]+)",window\.utimezone\.(\w+)\)'
+  for seed, zone in re.findall(pattern, bundle):
+    pattern = fr'name:"\w+/{zone}",info:"([\w=]+)",extras:"([\w=]+)"'
+    for info, extras in re.findall(pattern, bundle, re.IGNORECASE):
+      secret = base64.b64decode(seed + info + extras).decode('utf-8')
+      try:
+        call(base, 'userLibrary/getAlbumsList', {}, headers, secret)
+        return album, track, stream(base, headers, secret)
+      except urllib.error.URLError:
+        pass
+  raise ValueError('valid application secret not found')
+
+def save(metadata, audio):
+  def path(metadata):
+    try:
+      album = metadata['album']['title'].replace('/', '-')
+      artist = metadata['album']['artist']['name'].replace('/', '-')
+      title = metadata['title'].replace('/', '-')
+      if album[:1] in ['', '.'] or artist[:1] in ['', '.']:
+        raise ValueError('illegal album or artist name')
+      track = f"{metadata['track_number']:02d}"
+      if metadata['album']['media_count'] > 1:
+        track = f"{metadata['media_number'] + ord('A') - 1:c}{track}"
+    except KeyError:
+      raise ValueError('incomplete metadata')
+    os.makedirs(f'{artist}/{album}', exist_ok = True)
+    return f'{artist}/{album}/{track} {title}.flac'
+
+  def vorbis(metadata):
+    tags = {
+      'ALBUM': ['album', 'title'],
+      'ALBUMARTIST': ['album', 'artist', 'name'],
+      'ARTIST': ['performer', 'name'],
+      'COMPOSER': ['composer', 'name'],
+      'DATE': ['album', 'release_date_original'],
+      'DISCNUMBER': ['media_number'],
+      'DISCSUBTITLE': ['album', 'subtitle'],
+      'DISCTOTAL': ['album', 'media_count'],
+      'GENRE': ['album', 'genre', 'name'],
+      'ISRC': ['isrc'],
+      'LABEL': ['album', 'label', 'name'],
+      'PERFORMER': ['performer', 'name'],
+      'REPLAYGAIN_TRACK_GAIN': ['audio_info', 'replaygain_track_gain'],
+      'REPLAYGAIN_TRACK_PEAK': ['audio_info', 'replaygain_track_peak'],
+      'DISCTITLE': ['title'],
+      'TITLE': ['title'],
+      'TRACKNUMBER': ['track_number'],
+      'TRACKTOTAL': ['album', 'tracks_count'],
+      'VERSION': ['version']
+    }
+
+    for key in list(tags):
+      try:
+        tags[key] = functools.reduce(operator.getitem, tags[key], metadata)
+      except KeyError:
+        del tags[key]
+    return tags
+
+  if audio.read(4) != b'fLaC':
+    raise ValueError('unsupported stream format')
+
+  filename = path(metadata)
+  print(f'{filename}:', end = ' ', flush = True)
+  if os.path.exists(filename):
+    print('skipped', flush = True)
+    return
+
+  with open(filename + '.tmp', 'wb') as file:
+    file.write(b'fLaC')
+    while word := int.from_bytes(audio.read(4), 'big'):
+      data = audio.read(word & 0xffffff)
+      if word >> 24 & 0x7f in [0, 3]:
+        file.write(int.to_bytes(word & 0x7fffffff, 4, 'big'))
+        file.write(data)
+      if word >> 31:
+        break
+
+    vendor = 'qoget 1.0'.encode('utf-8')
+    data, tags = io.BytesIO(), vorbis(metadata)
+    data.write(int.to_bytes(len(vendor), 4, 'little') + vendor)
+    data.write(int.to_bytes(len(tags), 4, 'little'))
+    for key in sorted(tags):
+      pair = f'{key}={tags[key]}'.encode('utf-8')
+      data.write(int.to_bytes(len(pair), 4, 'little') + pair)
+    file.write(int.to_bytes(0x84000000 + data.tell(), 4, 'big'))
+    file.write(data.getbuffer())
+
+    while data := audio.read(1 << 20):
+      file.write(data)
+    os.rename(filename + '.tmp', filename)
+    print(f'{file.tell()/1048576:0.1f} MB', flush = True)
+
+if __name__ == '__main__':
+  try:
+    username, password = os.environ['QOBUZ'].split(':', 1)
+  except:
+    print('Please set QOBUZ to USERNAME:PASSWORD', file = sys.stderr)
+    sys.exit(1)
+
+  try:
+    album, track, stream = qobuz(username, password)
+  except Exception as error:
+    print('Failed to login to Qobuz:', error, file = sys.stderr)
+    sys.exit(1)
+
+  for item in sys.argv[1:] or map(str.strip, sys.stdin):
+    if re.fullmatch(r'[0-9a-z]{13}', item):
+      try:
+        for id in [item['id'] for item in album(item)['tracks']['items']]:
+          try:
+            save(track(id), stream(id))
+          except urllib.error.URLError:
+            print(f'Track {id} not found', file = sys.stderr)
+          except Exception as error:
+            print(f'Failed to get track {id}:', error, file = sys.stderr)
+      except urllib.error.URLError:
+        print(f'Album {item} not found')
+      except KeyError:
+        print(f'Album {item} has invalid metadata')
+
+    elif re.fullmatch(r'[0-9]{8,12}', item.strip()):
+      try:
+        save(track(item), stream(item))
+      except urllib.error.URLError:
+        print(f'Track {item} not found', file = sys.stderr)
+      except Exception as error:
+        print(f'Failed to get track {item}:', error, file = sys.stderr)
+
+    else:
+      print(f'{item} is not a track or album ID', file = sys.stderr)
