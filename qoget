@@ -2,6 +2,7 @@
 
 import base64
 import functools
+import getpass
 import gzip
 import hashlib
 import io
@@ -9,6 +10,7 @@ import json
 import operator
 import os
 import re
+import readline
 import sys
 import time
 import urllib.error
@@ -16,7 +18,7 @@ import urllib.parse
 import urllib.request
 
 def qobuz(username, password):
-  def call(base, endpoint, params, headers, secret = None):
+  def call(base, endpoint, params, headers = {}, secret = None):
     if secret:
       signature = hashlib.md5(endpoint.replace('/', '').encode('utf-8'))
       for key in sorted(params):
@@ -61,7 +63,7 @@ def qobuz(username, password):
 
   try:
     login = call(base, 'user/login', { 'app_id': api['app_id'],
-      'email': username, 'password': password }, {})
+      'email': username, 'password': password })
     headers = {
       'X-App-Id': api['app_id'],
       'X-User-Auth-Token': login['user_auth_token']
@@ -85,6 +87,16 @@ def qobuz(username, password):
       except urllib.error.URLError:
         pass
   raise ValueError('valid application secret not found')
+
+def readlines():
+  prompt = sys.stdin.isatty() and sys.stdout.isatty()
+  while True:
+    try:
+      if line := input('> ' * prompt).strip():
+        yield line
+    except (EOFError, KeyboardInterrupt):
+      sys.stdout.write('\n' * prompt)
+      break
 
 def save(metadata, audio):
   def path(metadata):
@@ -167,40 +179,68 @@ def save(metadata, audio):
     print(f'{file.tell()/1048576:0.1f} MB', flush = True)
 
 if __name__ == '__main__':
-  try:
+  def process(item, album, track, stream):
+    if match := re.search(r'(^|/album/)([0-9a-z]{13})$', item):
+      try:
+        for item in album(match[2])['tracks']['items']:
+          try:
+            save(track(item['id']), stream(item['id']))
+          except urllib.error.URLError:
+            print(f"Track {item['id']} not found", file = sys.stderr)
+          except KeyboardInterrupt as error:
+            sys.stdout.write('\n')
+            raise error from None
+          except Exception as error:
+            print(f"Failed to get track {item['id']}:", error,
+              file = sys.stderr)
+      except urllib.error.URLError:
+        print(f'Album {item} not found')
+      except KeyError:
+        print(f'Album {item} has invalid metadata')
+    elif match := re.search(r'(^|/track/)([0-9]{8,12})$', item):
+      try:
+        save(track(match[2]), stream(match[2]))
+      except urllib.error.URLError:
+        print(f'Track {match[2]} not found', file = sys.stderr)
+      except KeyboardInterrupt as error:
+        sys.stdout.write('\n')
+        raise error from None
+      except Exception as error:
+        print(f'Failed to get track {match[2]}:', error, file = sys.stderr)
+    else:
+      print(f'{item} is not a track or album ID/URL', file = sys.stderr)
+
+  if 'QOBUZ' in os.environ and ':' in os.environ['QOBUZ']:
     username, password = os.environ['QOBUZ'].split(':', 1)
-  except:
+    print('Authenticating to Qobuz as', username)
+  elif len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+    try:
+      username, password = input('Username: '), getpass.getpass()
+      readline.clear_history()
+    except (EOFError, KeyboardInterrupt):
+      sys.stdout.write('\n')
+      sys.exit(1)
+  else:
     print('Please set QOBUZ to USERNAME:PASSWORD', file = sys.stderr)
     sys.exit(1)
 
   try:
     album, track, stream = qobuz(username, password)
+    print('Login succeeded and application secret acquired')
   except Exception as error:
     print('Failed to login to Qobuz:', error, file = sys.stderr)
     sys.exit(1)
 
-  for item in sys.argv[1:] or map(str.strip, sys.stdin):
-    if re.fullmatch(r'[0-9a-z]{13}', item):
-      try:
-        for id in [item['id'] for item in album(item)['tracks']['items']]:
+  if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+    try:
+      while True:
+        if item := input('> ').strip():
           try:
-            save(track(id), stream(id))
-          except urllib.error.URLError:
-            print(f'Track {id} not found', file = sys.stderr)
-          except Exception as error:
-            print(f'Failed to get track {id}:', error, file = sys.stderr)
-      except urllib.error.URLError:
-        print(f'Album {item} not found')
-      except KeyError:
-        print(f'Album {item} has invalid metadata')
-
-    elif re.fullmatch(r'[0-9]{8,12}', item.strip()):
-      try:
-        save(track(item), stream(item))
-      except urllib.error.URLError:
-        print(f'Track {item} not found', file = sys.stderr)
-      except Exception as error:
-        print(f'Failed to get track {item}:', error, file = sys.stderr)
-
-    else:
-      print(f'{item} is not a track or album ID', file = sys.stderr)
+            process(item, album, track, stream)
+          except KeyboardInterrupt:
+            continue
+    except (EOFError, KeyboardInterrupt):
+      sys.stdout.write('\n')
+  else:
+    for item in sys.argv[1:] or map(str.strip, sys.stdin):
+      process(item, album, track, stream)
