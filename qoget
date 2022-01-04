@@ -82,7 +82,8 @@ def qobuz(username, password):
     for info, extras in re.findall(pattern, bundle, re.IGNORECASE):
       secret = base64.b64decode(seed + info + extras).decode('utf-8')
       try:
-        call(base, 'userLibrary/getAlbumsList', {}, headers, secret)
+        call(base, 'track/getFileUrl', { 'format_id': 27,
+          'intent': 'stream', 'track_id': 56624478 }, headers, secret)
         return album, track, stream(base, headers, secret)
       except urllib.error.URLError:
         pass
