@@ -102,9 +102,9 @@ def readlines():
 def save(metadata, audio):
   def path(metadata):
     try:
-      album = metadata['album']['title'].replace('/', '-')
-      artist = metadata['album']['artist']['name'].replace('/', '-')
-      title = metadata['title'].replace('/', '-')
+      album = metadata['album']['title'].replace('/', '-').strip()
+      artist = metadata['album']['artist']['name'].replace('/', '-').strip()
+      title = metadata['title'].replace('/', '-').strip()
       if album[:1] in ['', '.'] or artist[:1] in ['', '.']:
         raise ValueError('illegal album or artist name')
       track = f"{metadata['track_number']:02d}"
@@ -141,6 +141,8 @@ def save(metadata, audio):
     for key in list(tags):
       try:
         tags[key] = functools.reduce(operator.getitem, tags[key], metadata)
+        if hasattr(tags[key], 'strip'):
+          tags[key] = tags[key].strip()
       except KeyError:
         del tags[key]
     return tags
