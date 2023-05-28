@@ -55,17 +55,17 @@ def qobuz(username, password):
     raise ValueError('bundle.js not found on play.qobuz.com')
 
   try:
-    api = re.search(r'qobuzapi={\w+:"[^"]+"(?:,\w+:"[^"]+")*}', bundle)
-    api = dict(re.findall(r'(\w+):"([^"]+)"', api[0]))
-    base = api['base_url'] + api['base_method']
+    application = re.search(r'production:{api:{appId:"([^"]+)"', bundle)[1]
+    base = re.search(r'qobuzApi={baseUrl:"([^"]+)",baseMethod:"([^"]+)"',
+      bundle).expand(r'\1\2')
   except TypeError:
     raise ValueError('API parameters not found')
 
   try:
-    login = call(base, 'user/login', { 'app_id': api['app_id'],
+    login = call(base, 'user/login', { 'app_id': application,
       'email': username, 'password': password })
     headers = {
-      'X-App-Id': api['app_id'],
+      'X-App-Id': application,
       'X-User-Auth-Token': login['user_auth_token']
     }
   except urllib.error.URLError:
